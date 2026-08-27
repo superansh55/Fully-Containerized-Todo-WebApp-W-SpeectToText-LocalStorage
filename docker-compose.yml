@@ -1,0 +1,77 @@
+
+services:
+
+  # ── Whisper Speech-to-Text ──────────────────────────────────────
+  speech-service:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: devops_stt
+    environment:
+      - ASR_MODEL=tiny.en
+      - ASR_ENGINE=faster_whisper
+    ports:
+      - "9000:9000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/docs || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s   # whisper tiny model loading can take 60-90s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # ── Python FastAPI Backend ──────────────────────────────────────
+  app-backend:
+    build: ./backend
+    container_name: devops_backend
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_PATH=/app/data/tasks.db
+      - STT_URL=http://speech-service:9000/asr
+    volumes:
+      # Host bind-mount: ./data on your Windows disk is always in sync
+      # SQLite WAL mode ensures crash-safe writes even on container OOM kill
+      - ./data:/app/data
+    depends_on:
+      speech-service:
+        condition: service_started   # don't wait for whisper — backend works without STT
+    restart: unless-stopped
+    healthcheck:
+      # Simple TCP-level check via curl — avoids Python import overhead
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health', timeout=5)\" || exit 1"]
+      interval: 15s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  # ── React Frontend (nginx static serving) ──────────────────────
+  app-frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: /api
+    container_name: devops_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      app-backend:
+        condition: service_started   # nginx starts instantly; API calls retry from the browser
+    restart: unless-stopped
+    healthcheck:
+      # Check nginx itself serves the index page — NOT via /api proxy
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 64m
